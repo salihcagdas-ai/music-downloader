@@ -1,0 +1,16 @@
+.venv/
+downloads/
+archive-audio.txt
+archive-video.txt
+__pycache__/
+*.pyc
+.DS_Store
+
+# Kişisel veri / çalışma dosyaları — GitHub'a GİTMESİN
+# (satır-içi yorum kullanma; git desteklemez)
+# WhatsApp sohbet dışa aktarımı — kişi kartı + telefon numarası içerir
+*.zip
+# sohbetten çıkarılan kişisel link listeleri
+whatsapp-linkler*.txt
+# kişisel şarkı adı listesi
+sarki-isimleri.txt
