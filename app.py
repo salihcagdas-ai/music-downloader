@@ -8,10 +8,12 @@ Dışarıya (ağa) HİÇ açılmaz — sadece 127.0.0.1'e bağlanır.
 
 import os
 import re
+import sys
 import shutil
 import threading
 import uuid
 import subprocess
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, request, jsonify, render_template
@@ -20,20 +22,42 @@ import yt_dlp
 
 # --- Ayarlar --------------------------------------------------------------
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# PyInstaller ile tek .exe olarak paketlenince (Windows) çalışma şekli değişir:
+#   - FROZEN True olur.
+#   - Gömülü dosyalar (templates, ffmpeg) geçici bir klasöre (sys._MEIPASS) açılır
+#     — burası SALT OKUNUR ve uygulama kapanınca SİLİNİR.
+#   - O yüzden indirilenleri buraya değil, .exe'nin YANINA yazmalıyız.
+FROZEN = getattr(sys, "frozen", False)
+
+# RESOURCE_DIR: gömülü/okunur dosyalar (templates, gömülü ffmpeg).
+RESOURCE_DIR = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+# BASE_DIR: yazılabilir dosyalar (downloads, arşiv). exe ise exe'nin yanı.
+if FROZEN:
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 # Arşivi FORMATA GÖRE ayrı tutuyoruz. Aksi halde bir videoyu mp3 olarak
 # indirince, aynı videoyu mp4 isteyince "zaten var" deyip atlardı.
 ARCHIVE_AUDIO = os.path.join(BASE_DIR, "archive-audio.txt")
 ARCHIVE_VIDEO = os.path.join(BASE_DIR, "archive-video.txt")
 
-# ffmpeg'i güvenilir şekilde bul. Uygulama Finder'dan (çift tıkla) açıldığında
-# PATH sınırlı olur ve yt-dlp ffmpeg'i bulamaz → mp3'e çeviremez. O yüzden
-# yaygın konumları elle kontrol edip yt-dlp'ye tam yolu veriyoruz.
+# ffmpeg'i güvenilir şekilde bul (mp3'e çevirmek / mp4 birleştirmek için şart).
+#   1) Windows .exe: ffmpeg gömülü gelir → RESOURCE_DIR içinde ara.
+#   2) PATH'te varsa (shutil.which) — Finder'dan açılınca PATH dar olabilir.
+#   3) Mac (brew) yaygın konumları / Windows yaygın konumları.
 def _find_ffmpeg():
-    for cand in (shutil.which("ffmpeg"),
-                 "/opt/homebrew/bin/ffmpeg",   # Apple Silicon (brew)
-                 "/usr/local/bin/ffmpeg"):     # Intel (brew)
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    candidates = [
+        os.path.join(RESOURCE_DIR, exe),          # gömülü (PyInstaller)
+        os.path.join(BASE_DIR, exe),              # exe'nin yanı
+        shutil.which("ffmpeg"),                   # PATH
+        "/opt/homebrew/bin/ffmpeg",               # Mac Apple Silicon (brew)
+        "/usr/local/bin/ffmpeg",                  # Mac Intel (brew)
+        r"C:\ffmpeg\bin\ffmpeg.exe",              # Windows yaygın
+    ]
+    for cand in candidates:
         if cand and os.path.exists(cand):
             return cand
     return None
@@ -58,7 +82,9 @@ FILENAME_TEMPLATE = "%(title).180B [%(id)s].%(ext)s"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-app = Flask(__name__)
+# template_folder'ı açıkça veriyoruz: exe olarak paketlenince şablonlar
+# RESOURCE_DIR (gömülü) içinde olur; normal çalışmada ise app.py'nin yanında.
+app = Flask(__name__, template_folder=os.path.join(RESOURCE_DIR, "templates"))
 
 # İşleri bellekte tutuyoruz (uygulama kapanınca sıfırlanır — sorun değil,
 # indirilen dosyalar diskte kalıyor ve archive.txt tekrar indirmeyi engelliyor).
@@ -273,9 +299,15 @@ def api_clear():
 
 @app.route("/api/open-folder", methods=["POST"])
 def api_open_folder():
-    """İndirilenler klasörünü Finder'da açar (sadece macOS)."""
+    """İndirilenler klasörünü sistem dosya yöneticisinde açar (Mac/Windows/Linux)."""
     try:
-        subprocess.Popen(["open", DOWNLOAD_DIR])
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", DOWNLOAD_DIR])
+        elif os.name == "nt":
+            os.startfile(DOWNLOAD_DIR)  # noqa: only exists on Windows
+        else:
+            subprocess.Popen(["xdg-open", DOWNLOAD_DIR])
         return jsonify({"ok": True})
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": str(e)}), 500
@@ -292,8 +324,27 @@ def api_shutdown():
 
 
 if __name__ == "__main__":
+    # Windows .exe (--noconsole) modunda stdout/stderr None olur; print/werkzeug
+    # log'u çökmesin diye .exe'nin yanına bir log dosyasına yönlendir. Bu log
+    # aynı zamanda bir sorun olursa teşhis için işe yarar.
+    if FROZEN and (sys.stdout is None or sys.stderr is None):
+        _logf = open(os.path.join(BASE_DIR, "muzik-indirici.log"), "a",
+                     encoding="utf-8", buffering=1)
+        if sys.stdout is None:
+            sys.stdout = _logf
+        if sys.stderr is None:
+            sys.stderr = _logf
+
+    URL = "http://127.0.0.1:5001"
     print("\n  🎵  Music Downloader çalışıyor")
-    print("  →  Tarayıcıda aç:  http://127.0.0.1:5001\n")
+    print(f"  →  Tarayıcıda aç:  {URL}\n")
+
+    # Windows .exe olarak çalışırken tarayıcıyı açacak ayrı bir launcher yok;
+    # o yüzden sunucu kalkar kalkmaz tarayıcıyı uygulamanın kendisi açar.
+    # (Mac'te tarayıcıyı .app/run.sh açtığı için orada tekrar açmıyoruz.)
+    if FROZEN:
+        threading.Timer(1.5, lambda: webbrowser.open(URL)).start()
+
     # host='127.0.0.1' KRİTİK: uygulama sadece kendi bilgisayarından erişilebilir,
     # ağdaki başka cihazlar bağlanamaz. Güvenlik için böyle bırak.
     app.run(host="127.0.0.1", port=5001, threaded=True, debug=False)

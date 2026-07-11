@@ -55,6 +55,22 @@ caffeinate -i ./run.sh
 
 ---
 
+## 🪟 Windows sürümü (tek .exe, kurulum gerektirmez)
+
+Windows için **Python/ffmpeg kurmaya gerek olmadan** çalışan tek bir `.exe` üretilir —
+GitHub'ın Windows sunucusunda otomatik derlenir.
+
+**İndirmek için:**
+1. GitHub'da depoya git → üstteki **Actions** sekmesi.
+2. **"Windows EXE derle"** iş akışının en son başarılı (yeşil ✓) çalışmasına tıkla.
+3. Alttaki **Artifacts** kısmından **`MuzikIndirici-Windows`**'u indir, zip'i aç.
+4. Çıkan **`MuzikIndirici.exe`**'yi Windows'ta çift tıkla — tarayıcı açılır, gerisi Mac'le aynı (yapıştır → indir → ⏻ Kapat).
+
+> Elle yeni derleme: Actions → "Windows EXE derle" → **Run workflow**.
+> İndirilenler `.exe`'nin bulunduğu klasördeki `downloads/` altına iner.
+
+---
+
 ## 🔧 Nasıl çalışıyor (teknik özet)
 
 | Parça | Görevi |

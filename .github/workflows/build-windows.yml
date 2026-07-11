@@ -1,0 +1,60 @@
+name: Windows EXE derle
+
+# GitHub'ın Windows sunucusunda tek-dosya .exe üretir (Python + ffmpeg gömülü).
+# Elle "Run workflow" ile ya da app.py / arayüz değişince otomatik çalışır.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "app.py"
+      - "templates/**"
+      - "requirements.txt"
+      - ".github/workflows/build-windows.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bağımlılıklar
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: ffmpeg indir (Windows)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+          $bin = (Get-ChildItem -Path ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          Copy-Item "$bin\ffmpeg.exe"  -Destination ffmpeg.exe
+          Copy-Item "$bin\ffprobe.exe" -Destination ffprobe.exe
+          Write-Host "ffmpeg hazır:"; Get-Item ffmpeg.exe, ffprobe.exe | Select-Object Name, Length
+
+      - name: EXE derle
+        shell: cmd
+        run: >
+          pyinstaller --onefile --noconsole --clean --name MuzikIndirici
+          --add-data "templates;templates"
+          --add-binary "ffmpeg.exe;."
+          --add-binary "ffprobe.exe;."
+          --collect-all yt_dlp
+          --collect-all certifi
+          app.py
+
+      - name: EXE'yi yükle (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: MuzikIndirici-Windows
+          path: dist/MuzikIndirici.exe
+          if-no-files-found: error
