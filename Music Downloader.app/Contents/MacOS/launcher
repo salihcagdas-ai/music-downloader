@@ -1,7 +1,8 @@
 #!/bin/bash
 # This launcher stays beside the repository; it is not a standalone macOS app.
 set -euo pipefail
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Finder may omit the default Deno location; retain custom tool paths as well.
+export PATH="$HOME/.deno/bin:/opt/homebrew/bin:/usr/local/bin:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
 PROJECT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$PROJECT_DIR"
 

@@ -85,6 +85,30 @@ and uses the same `.venv`; it is not a self-contained, signed or notarized app.
 macOS and Linux launchers have not been executed on their target platforms in
 this maintenance pass.
 
+### First-run checks
+
+If a download reports a missing tool, open a new terminal and check:
+
+```bash
+ffmpeg -version
+ffprobe -version
+node --version
+```
+
+Use `deno --version` instead of the last command when using Deno. Restart Music
+Downloader after installing tools or changing `PATH`. The macOS launcher also
+checks the usual `$HOME/.deno/bin` location and retains inherited tool paths.
+
+- **Port 5001 is in use:** close an already running copy before starting another.
+- **HTTP 403 or a rate-limit error:** try the link again later. Some failures are
+  temporary; others reflect a site's access rules or a changed extractor. Check
+  upstream yt-dlp updates if a public, supported link keeps failing.
+- **An archived item is skipped:** the format archive already records that item.
+  Changing audio quality alone does not create a new download.
+
+There is no published ready-made installer yet. Use the source setup above or
+build the Windows executable below; a GitHub source ZIP is not a standalone app.
+
 ## Local files and queue behavior
 
 ```text
@@ -166,6 +190,15 @@ Offline tests use synthetic downloader results and do not download real media.
 They check application behavior, not ongoing YouTube/Facebook availability.
 Site changes, authentication requirements, regional restrictions and rate limits
 can still cause failures. Download speed and media quality are not benchmarked.
+
+A live smoke check on 2026-11-19 used a ten-second, Creative Commons licensed
+[upstream test clip](https://www.youtube.com/watch?v=DTi8wZ1a1TA) on Windows with
+Python 3.12, Node.js 24 and FFmpeg 9.0.2. FFprobe confirmed MP3 audio and an MP4
+containing H.264 video plus AAC audio. A repeated audio request was skipped and
+the existing file stayed unchanged. The first video attempt received HTTP 403;
+a fresh request with the same settings succeeded. This is one sample, not a
+site-wide compatibility guarantee. Facebook live downloads remain unverified.
+The downloaded test media is not included in this repository.
 
 MP4 remuxing changes the container; it does not guarantee that every source codec
 plays on every device. Audio bitrate selection also cannot restore quality absent
