@@ -1,350 +1,570 @@
-"""
-Local YouTube / Facebook downloader.
+"""A loopback-only YouTube/Facebook downloader with bounded background jobs.
 
-Tek bilgisayarında (localhost) çalışan küçük bir web uygulaması.
-Arayüze linkleri yapıştırırsın, arkada yt-dlp indirir.
-Dışarıya (ağa) HİÇ açılmaz — sadece 127.0.0.1'e bağlanır.
+Only download media you own or have permission to save. Downloads and format
+archives remain local. No browser cookies or account credentials are loaded.
 """
 
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import math
 import os
 import re
-import sys
+import secrets
 import shutil
+import subprocess
+import sys
 import threading
 import uuid
-import subprocess
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
-
-from flask import Flask, request, jsonify, render_template
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yt_dlp
+from flask import Flask, jsonify, render_template, request
 
-# --- Ayarlar --------------------------------------------------------------
-
-# PyInstaller ile tek .exe olarak paketlenince (Windows) çalışma şekli değişir:
-#   - FROZEN True olur.
-#   - Gömülü dosyalar (templates, ffmpeg) geçici bir klasöre (sys._MEIPASS) açılır
-#     — burası SALT OKUNUR ve uygulama kapanınca SİLİNİR.
-#   - O yüzden indirilenleri buraya değil, .exe'nin YANINA yazmalıyız.
 FROZEN = getattr(sys, "frozen", False)
-
-# RESOURCE_DIR: gömülü/okunur dosyalar (templates, gömülü ffmpeg).
-RESOURCE_DIR = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
-# BASE_DIR: yazılabilir dosyalar (downloads, arşiv). exe ise exe'nin yanı.
-if FROZEN:
-    BASE_DIR = os.path.dirname(sys.executable)
-else:
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
-# Arşivi FORMATA GÖRE ayrı tutuyoruz. Aksi halde bir videoyu mp3 olarak
-# indirince, aynı videoyu mp4 isteyince "zaten var" deyip atlardı.
-ARCHIVE_AUDIO = os.path.join(BASE_DIR, "archive-audio.txt")
-ARCHIVE_VIDEO = os.path.join(BASE_DIR, "archive-video.txt")
-
-# ffmpeg'i güvenilir şekilde bul (mp3'e çevirmek / mp4 birleştirmek için şart).
-#   1) Windows .exe: ffmpeg gömülü gelir → RESOURCE_DIR içinde ara.
-#   2) PATH'te varsa (shutil.which) — Finder'dan açılınca PATH dar olabilir.
-#   3) Mac (brew) yaygın konumları / Windows yaygın konumları.
-def _find_ffmpeg():
-    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    candidates = [
-        os.path.join(RESOURCE_DIR, exe),          # gömülü (PyInstaller)
-        os.path.join(BASE_DIR, exe),              # exe'nin yanı
-        shutil.which("ffmpeg"),                   # PATH
-        "/opt/homebrew/bin/ffmpeg",               # Mac Apple Silicon (brew)
-        "/usr/local/bin/ffmpeg",                  # Mac Intel (brew)
-        r"C:\ffmpeg\bin\ffmpeg.exe",              # Windows yaygın
-    ]
-    for cand in candidates:
-        if cand and os.path.exists(cand):
-            return cand
-    return None
-
-FFMPEG = _find_ffmpeg()
-
-# Aynı anda kaç indirme yapılsın
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+BASE_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 MAX_CONCURRENT = 3
-
-# Bellekte tutulacak en fazla iş sayısı (uzun oturumda şişmeyi engeller).
-# Sınır aşılınca en eski BİTMİŞ/HATALI işler listeden düşer (dosyalara dokunulmaz).
 MAX_JOBS = 200
-
-# Dosya adı şablonu.
-#   [%(id)s]  → videonun benzersiz kimliği; aynı başlıklı FARKLI videoların
-#               birbirini sessizce ezmesini (veri kaybı) engeller.
-#   .180B     → başlığı 180 bayta kırpar; çok uzun / emoji / CJK başlıkların
-#               macOS'ta "dosya adı çok uzun" hatası vermesini önler.
-# Kimliksiz TEMİZ isim istersen:  "%(title).180B.%(ext)s"
-# (ama nadiren aynı isimli iki farklı video çakışabilir.)
-FILENAME_TEMPLATE = "%(title).180B [%(id)s].%(ext)s"
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-# template_folder'ı açıkça veriyoruz: exe olarak paketlenince şablonlar
-# RESOURCE_DIR (gömülü) içinde olur; normal çalışmada ise app.py'nin yanında.
-app = Flask(__name__, template_folder=os.path.join(RESOURCE_DIR, "templates"))
-
-# İşleri bellekte tutuyoruz (uygulama kapanınca sıfırlanır — sorun değil,
-# indirilen dosyalar diskte kalıyor ve archive.txt tekrar indirmeyi engelliyor).
-jobs = {}
-jobs_lock = threading.Lock()
-executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
-
-
-# --- Yardımcılar ----------------------------------------------------------
-
-def _update(job_id, **fields):
-    """Bir işin durumunu güvenli şekilde günceller."""
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id].update(fields)
-
-
-def _make_progress_hook(job_id):
-    """yt-dlp'nin indirme sırasında çağıracağı ilerleme fonksiyonu."""
-    def hook(d):
-        status = d.get("status")
-        if status == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            downloaded = d.get("downloaded_bytes") or 0
-            percent = (downloaded / total * 100) if total else 0
-            _update(
-                job_id,
-                status="downloading",
-                percent=round(percent, 1),
-                speed=d.get("_speed_str", "").strip(),
-                eta=d.get("_eta_str", "").strip(),
-                title=(d.get("info_dict") or {}).get("title") or jobs.get(job_id, {}).get("title"),
-            )
-        elif status == "finished":
-            # İndirme bitti; şimdi ffmpeg dönüştürme/birleştirme aşaması olabilir.
-            _update(job_id, status="processing", percent=100)
-    return hook
-
-
-def _ydl_opts(job_id, fmt, quality):
-    """Ses / video için yt-dlp seçeneklerini hazırlar."""
-    outtmpl = os.path.join(DOWNLOAD_DIR, FILENAME_TEMPLATE)
-    archive = ARCHIVE_AUDIO if fmt == "audio" else ARCHIVE_VIDEO
-    common = {
-        "outtmpl": outtmpl,
-        "download_archive": archive,        # aynı şeyi iki kez indirmeyi engeller
-        "progress_hooks": [_make_progress_hook(job_id)],
-        "ignoreerrors": False,
-        "noplaylist": False,                # playlist linki verilirse hepsini indir
-        "quiet": True,
-        "no_warnings": True,
-        "windowsfilenames": True,           # dosya adlarını güvenli tut
-        "restrictfilenames": False,
-        # Takılan bir bağlantı bir işçiyi (worker) sonsuza dek kilitlemesin:
-        "socket_timeout": 30,               # 30 sn cevap gelmezse hata ver
-        "retries": 5,
-        "fragment_retries": 5,
+MAX_URLS_PER_REQUEST = 20
+MAX_PLAYLIST_ITEMS = 50
+TERMINAL = frozenset({"done", "error", "skipped"})
+QUALITY = frozenset({"128", "192", "256", "320"})
+YOUTUBE_HOSTS = frozenset(
+    {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+)
+FACEBOOK_HOSTS = frozenset(
+    {
+        "facebook.com",
+        "www.facebook.com",
+        "m.facebook.com",
+        "web.facebook.com",
+        "mbasic.facebook.com",
+        "fb.watch",
+        "www.fb.watch",
     }
-    if FFMPEG:
-        common["ffmpeg_location"] = FFMPEG
-
-    if fmt == "audio":
-        common.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": quality or "192",
-            }],
-        })
-    else:  # video
-        # En iyi mp4 video + m4a ses, mp4 olarak birleştir.
-        common.update({
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "merge_output_format": "mp4",
-        })
-    return common
+)
+FILENAME_TEMPLATE = "%(title).160B [%(extractor_key)s-%(id)s].%(ext)s"
 
 
-def _run_download(job_id, url, fmt, quality):
-    """Tek bir linki indirir (arka planda thread içinde çalışır)."""
-    _update(job_id, status="downloading")
+def find_ffmpeg():
+    executable = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    candidates = (
+        RESOURCE_DIR / executable,
+        BASE_DIR / executable,
+        shutil.which("ffmpeg"),
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+    )
+    return next((str(path) for path in candidates if path and Path(path).is_file()), None)
+
+
+def find_js_runtimes():
+    for runtime in ("deno", "node"):
+        location = shutil.which(runtime)
+        if location:
+            return {runtime: {"path": location}}
+    return {}
+
+
+def normalize_url(value):
+    """Accept supported public-site URL shapes without DNS or network requests."""
+    if not isinstance(value, str) or len(value) > 2048:
+        raise ValueError("Each URL must be text of at most 2,048 characters")
+    value = value.strip()
+    if not value or any(char.isspace() or ord(char) < 32 for char in value) or "\\" in value:
+        raise ValueError("URLs cannot contain whitespace, control characters or backslashes")
     try:
-        opts = _ydl_opts(job_id, fmt, quality)
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-        # info None ise: video arşivde kayıtlı, yt-dlp tekrar indirmeyi atladı.
-        if info is None:
-            existing = jobs.get(job_id, {}).get("title")
-            nice = existing if existing and existing != url else "✓ Zaten indirilmiş"
-            _update(job_id, status="done", percent=100, title=nice)
-            return
-
-        title = None
-        if isinstance(info, dict):
-            title = info.get("title")
-            if info.get("_type") == "playlist":
-                base = info.get("title") or "Playlist"
-                # entries = BU çalıştırmada yeni inen; playlist_count = gerçek toplam.
-                new_n = len(info.get("entries") or [])
-                total = info.get("playlist_count") or new_n
-                if new_n == 0:
-                    title = f"{base} — hepsi zaten indirilmiş ({total} parça)"
-                elif new_n < total:
-                    title = f"{base} ({new_n} yeni / {total} toplam)"
-                else:
-                    title = f"{base} ({total} parça)"
-
-        _update(job_id, status="done", percent=100, title=title or url)
-    except yt_dlp.utils.DownloadError as e:
-        _update(job_id, status="error", error=_clean_error(str(e)))
-    except Exception as e:  # noqa: BLE001 — kullanıcıya anlamlı mesaj göster
-        _update(job_id, status="error", error=str(e))
-
-
-def _clean_error(msg):
-    """yt-dlp hata mesajındaki ANSI renk kodlarını ve ERROR: önekini temizler."""
-    msg = re.sub(r"\x1b\[[0-9;]*m", "", msg)
-    msg = re.sub(r"^\s*ERROR:\s*", "", msg)
-    return msg.strip()
-
-
-def _looks_like_url(s):
-    return bool(re.match(r"^https?://", s.strip(), re.IGNORECASE))
-
-
-def _prune_jobs():
-    """Bellek ve /api/jobs cevabı şişmesin diye en eski BİTMİŞ/HATALI işleri düşür.
-    Sadece 'done'/'error' işler silinir; sıradaki/inen işlere dokunulmaz.
-    Diskteki dosyalar ve arşiv etkilenmez."""
-    with jobs_lock:
-        if len(jobs) <= MAX_JOBS:
-            return
-        excess = len(jobs) - MAX_JOBS
-        # dict ekleme sırasını korur → en eskiden başla.
-        for jid in list(jobs.keys()):
-            if excess <= 0:
-                break
-            if jobs[jid]["status"] in ("done", "error"):
-                del jobs[jid]
-                excess -= 1
-
-
-# --- Rotalar --------------------------------------------------------------
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-@app.route("/api/download", methods=["POST"])
-def api_download():
-    data = request.get_json(force=True, silent=True) or {}
-    raw = data.get("urls", "")
-    fmt = data.get("format", "audio")
-    quality = data.get("quality", "192")
-
-    if fmt not in ("audio", "video"):
-        fmt = "audio"
-
-    # Metni satırlara böl, sadece http(s) linklerini al, tekrarları ayıkla.
-    urls = []
-    seen = set()
-    for line in raw.splitlines():
-        line = line.strip()
-        if line and _looks_like_url(line) and line not in seen:
-            seen.add(line)
-            urls.append(line)
-
-    if not urls:
-        return jsonify({"error": "Geçerli link bulunamadı (http/https ile başlamalı)."}), 400
-
-    new_ids = []
-    for url in urls:
-        job_id = uuid.uuid4().hex[:8]
-        with jobs_lock:
-            jobs[job_id] = {
-                "id": job_id,
-                "url": url,
-                "format": fmt,
-                "status": "queued",
-                "title": url,
-                "percent": 0,
-                "speed": "",
-                "eta": "",
-                "error": None,
-            }
-        new_ids.append(job_id)
-        executor.submit(_run_download, job_id, url, fmt, quality)
-
-    _prune_jobs()
-    return jsonify({"queued": new_ids, "count": len(new_ids)})
-
-
-@app.route("/api/jobs")
-def api_jobs():
-    with jobs_lock:
-        # En yeni en üstte olacak şekilde ters çevir.
-        return jsonify(list(reversed(list(jobs.values()))))
-
-
-@app.route("/api/clear", methods=["POST"])
-def api_clear():
-    """Bitmiş/hatalı işleri listeden temizler (dosyalara dokunmaz)."""
-    with jobs_lock:
-        for jid in list(jobs.keys()):
-            if jobs[jid]["status"] in ("done", "error"):
-                del jobs[jid]
-    return jsonify({"ok": True})
-
-
-@app.route("/api/open-folder", methods=["POST"])
-def api_open_folder():
-    """İndirilenler klasörünü sistem dosya yöneticisinde açar (Mac/Windows/Linux)."""
-    try:
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", DOWNLOAD_DIR])
-        elif os.name == "nt":
-            os.startfile(DOWNLOAD_DIR)  # noqa: only exists on Windows
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError as error:
+        raise ValueError("Invalid URL") from error
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise ValueError("Only public HTTP(S) YouTube or Facebook links are supported")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("URLs containing credentials are not allowed")
+    if port is not None and port != (443 if parts.scheme == "https" else 80):
+        raise ValueError("Only standard HTTP(S) ports are supported")
+    host = parts.hostname.lower()
+    if host not in YOUTUBE_HOSTS | FACEBOOK_HOSTS:
+        raise ValueError("Only YouTube and Facebook video or playlist links are supported")
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    query = dict(pairs)
+    if any(
+        key.lower() in {"u", "url", "redirect", "redirect_url", "redirect_uri", "next"}
+        for key, _ in pairs
+    ):
+        raise ValueError("Redirect URLs are not supported")
+    if host in YOUTUBE_HOSTS:
+        if parts.path == "/playlist":
+            identifier = query.get("list", "")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", identifier):
+                raise ValueError("A valid YouTube playlist identifier is required")
+            return "https://www.youtube.com/playlist?" + urlencode({"list": identifier})
+        if host == "youtu.be":
+            identifier = parts.path.strip("/")
+        elif parts.path == "/watch":
+            identifier = query.get("v", "")
         else:
-            subprocess.Popen(["xdg-open", DOWNLOAD_DIR])
-        return jsonify({"ok": True})
-    except Exception as e:  # noqa: BLE001
-        return jsonify({"error": str(e)}), 500
+            match = re.fullmatch(r"/(?:shorts|live|embed)/([A-Za-z0-9_-]{11})/?", parts.path)
+            identifier = match.group(1) if match else ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", identifier):
+            raise ValueError("Use a YouTube video, Shorts, live-video or playlist link")
+        # A watch URL with list= still means one video; use /playlist for a playlist.
+        return "https://www.youtube.com/watch?" + urlencode({"v": identifier})
+    if host in {"fb.watch", "www.fb.watch"}:
+        if not re.fullmatch(r"/[A-Za-z0-9_-]+/?", parts.path):
+            raise ValueError("Invalid Facebook short link")
+        return "https://fb.watch/" + parts.path.strip("/") + "/"
+    path = parts.path.rstrip("/")
+    is_video = (path == "/watch" and query.get("v", "").isdigit()) or bool(
+        re.fullmatch(r"/reel/[0-9]+", path)
+        or re.fullmatch(r"/[^/]+/videos/(?:[^/]+/)?[0-9]+", path)
+        or re.fullmatch(r"/share/[rv]/[A-Za-z0-9_-]+", path)
+        or (path in {"/video.php", "/watch.php"} and query.get("v", "").isdigit())
+    )
+    if not is_video:
+        raise ValueError("Use a Facebook video, reel, share-video or fb.watch link")
+    kept = [
+        (key, val)
+        for key, val in pairs
+        if not key.lower().startswith("utm_") and key not in {"fbclid", "mibextid"}
+    ]
+    return urlunsplit(
+        ("https", "www.facebook.com", path + ("/" if path == "/watch" else ""), urlencode(kept), "")
+    )
 
 
-@app.route("/api/shutdown", methods=["POST"])
-def api_shutdown():
-    """Sunucuyu kapatır. Arayüzdeki '⏻ Kapat' butonu buraya istek atar; böylece
-    teknik olmayan kullanıcı terminal bilmeden sunucuyu durdurabilir.
-    Sadece 127.0.0.1'den erişilebildiği için dışarıdan tetiklenemez.
-    Önce cevabı gönderip kısa bir gecikmeyle süreci sonlandırıyoruz."""
-    threading.Timer(0.5, lambda: os._exit(0)).start()
-    return jsonify({"ok": True})
+def clean_error(message):
+    message = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", str(message))
+    message = re.sub(r"^\s*ERROR:\s*", "", message)
+    return " ".join(message.split())[:1000]
+
+
+class ArchiveAwareYoutubeDL(yt_dlp.YoutubeDL):
+    """Observe actual archive matches; None alone is not proof of a skip."""
+
+    def __init__(self, options):
+        self.skipped_ids = set()
+        super().__init__(options)
+
+    def in_download_archive(self, info):
+        skipped = super().in_download_archive(info)
+        if skipped:
+            extractor = str(info.get("extractor_key") or info.get("ie_key") or "").lower()
+            self.skipped_ids.add((extractor, info.get("id")))
+        return skipped
+
+    @property
+    def skipped_count(self):
+        return len(self.skipped_ids)
+
+
+class JobManager:
+    def __init__(self, base_dir, ffmpeg, js_runtimes, downloader_factory, executor):
+        self.base_dir = Path(base_dir)
+        self.download_dir = self.base_dir / "downloads"
+        self.ffmpeg = ffmpeg
+        self.js_runtimes = js_runtimes
+        self.downloader_factory = downloader_factory
+        self.executor = executor
+        self.jobs = {}
+        self.lock = threading.Lock()
+        # Serialize each format so concurrent playlists cannot race one archive
+        # or overwrite the same media file. Audio and video can run together.
+        self.format_locks = {"audio": threading.Lock(), "video": threading.Lock()}
+        self.closing = False
+
+    def update(self, identifier, **fields):
+        with self.lock:
+            row = self.jobs.get(identifier)
+            if row is not None and row["status"] not in TERMINAL:
+                row.update(fields)
+
+    def progress_hook(self, identifier):
+        def progress(data):
+            if data.get("status") == "downloading":
+                total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+                downloaded = data.get("downloaded_bytes") or 0
+                percent = 100 * downloaded / total if total else 0
+                percent = max(0, min(100, percent)) if math.isfinite(percent) else 0
+                fields = {
+                    "status": "downloading",
+                    "percent": round(percent, 1),
+                    "speed": clean_error(data.get("_speed_str", "")),
+                    "eta": clean_error(data.get("_eta_str", "")),
+                }
+                title = (data.get("info_dict") or {}).get("title")
+                if isinstance(title, str) and title:
+                    fields["title"] = title[:500]
+                self.update(identifier, **fields)
+            elif data.get("status") == "finished":
+                self.update(identifier, status="processing", percent=100)
+
+        return progress
+
+    def options(self, identifier, fmt, quality, completed):
+        folder = self.download_dir / fmt
+        folder.mkdir(parents=True, exist_ok=True)
+        expected_extension = ".mp3" if fmt == "audio" else ".mp4"
+
+        def finished(filename):
+            path = Path(filename).resolve()
+            if (
+                folder.resolve() not in path.parents
+                or path.suffix.lower() != expected_extension
+                or not path.is_file()
+            ):
+                raise RuntimeError(
+                    "Postprocessing did not produce the requested local output format"
+                )
+            completed.add(str(path))
+
+        options = {
+            "outtmpl": str(folder / FILENAME_TEMPLATE),
+            "download_archive": str(self.base_dir / f"archive-{fmt}.txt"),
+            "progress_hooks": [self.progress_hook(identifier)],
+            "post_hooks": [finished],
+            "ignoreerrors": False,
+            "noplaylist": True,
+            "playlistend": MAX_PLAYLIST_ITEMS,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "windowsfilenames": True,
+            "restrictfilenames": False,
+            "socket_timeout": 30,
+            "retries": 3,
+            "fragment_retries": 3,
+            "ffmpeg_location": self.ffmpeg,
+            "cachedir": False,
+            "allowed_extractors": ["youtube.*", "facebook.*"],
+            "js_runtimes": self.js_runtimes,
+            "remote_components": set(),
+            "overwrites": False,
+            "final_ext": expected_extension.lstrip("."),
+            "color": "no_color",
+        }
+        if fmt == "audio":
+            options.update(
+                format="bestaudio/best",
+                postprocessors=[
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": quality,
+                        "nopostoverwrites": True,
+                    }
+                ],
+            )
+        else:
+            options.update(
+                format="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                merge_output_format="mp4",
+                postprocessors=[
+                    {
+                        "key": "FFmpegVideoRemuxer",
+                        "preferedformat": "mp4",
+                    }
+                ],
+            )
+        return options
+
+    def run(self, identifier, url, fmt, quality):
+        completed = set()
+        try:
+            with self.format_locks[fmt]:
+                self.update(identifier, status="downloading")
+                options = self.options(identifier, fmt, quality, completed)
+                with self.downloader_factory(options) as downloader:
+                    info = downloader.extract_info(url, download=True)
+                    skipped = int(getattr(downloader, "skipped_count", 0))
+                title = info.get("title") if isinstance(info, dict) else None
+                if not isinstance(title, str) or not title:
+                    title = "Already in the archive" if skipped else "Download completed"
+                message = f"Completed {len(completed)} item(s); skipped {skipped} archived item(s)."
+                if isinstance(info, dict) and info.get("_type") in {"playlist", "multi_video"}:
+                    message += (
+                        f" At most the first {MAX_PLAYLIST_ITEMS} playlist entries are considered."
+                    )
+                if not completed and not skipped:
+                    raise RuntimeError(
+                        "No downloadable media or confirmed archive match was returned"
+                    )
+                self.update(
+                    identifier,
+                    status="done" if completed else "skipped",
+                    percent=100,
+                    title=title[:500],
+                    message=message,
+                    speed="",
+                    eta="",
+                )
+        except Exception as error:
+            self.update(
+                identifier,
+                status="error",
+                error=clean_error(error),
+                speed="",
+                eta="",
+                message=(
+                    f"Completed {len(completed)} item(s) before the error; "
+                    "completed files remain local."
+                ),
+            )
+
+    def submit(self, urls, fmt, quality):
+        with self.lock:
+            if self.closing:
+                return {"error": "The application is shutting down"}, 503
+            active = {
+                (row["url"], row["format"]): row["id"]
+                for row in self.jobs.values()
+                if row["status"] not in TERMINAL
+            }
+            duplicate = [
+                {"url": url, "id": active[(url, fmt)]} for url in urls if (url, fmt) in active
+            ]
+            new_urls = [url for url in urls if (url, fmt) not in active]
+            if len(active) + len(new_urls) > MAX_JOBS:
+                return {
+                    "error": "All 200 job slots are active; wait for some downloads to finish"
+                }, 429
+            excess = max(0, len(self.jobs) + len(new_urls) - MAX_JOBS)
+            for identifier in list(self.jobs):
+                if not excess:
+                    break
+                if self.jobs[identifier]["status"] in TERMINAL:
+                    del self.jobs[identifier]
+                    excess -= 1
+            pending = []
+            for url in new_urls:
+                identifier = uuid.uuid4().hex
+                self.jobs[identifier] = {
+                    "id": identifier,
+                    "url": url,
+                    "format": fmt,
+                    "status": "queued",
+                    "title": url,
+                    "percent": 0,
+                    "speed": "",
+                    "eta": "",
+                    "error": None,
+                    "message": "Waiting for a worker and format archive",
+                }
+                pending.append((identifier, url))
+        queued = []
+        for identifier, url in pending:
+            try:
+                self.executor.submit(self.run, identifier, url, fmt, quality)
+                queued.append(identifier)
+            except RuntimeError:
+                self.update(identifier, status="error", error="The worker queue is unavailable")
+        result = {"queued": queued, "count": len(queued), "duplicates": duplicate}
+        if pending and not queued:
+            result["error"] = "The worker queue is unavailable"
+            return result, 503
+        return result, 202 if queued else 200
+
+
+def open_download_folder(path):
+    Path(path).mkdir(parents=True, exist_ok=True)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    elif os.name == "nt":
+        os.startfile(str(path))
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
+def create_app(
+    config=None,
+    *,
+    downloader_factory=None,
+    executor=None,
+    folder_opener=None,
+    shutdown_callback=None,
+):
+    app = Flask(
+        __name__,
+        template_folder=str(RESOURCE_DIR / "templates"),
+        static_folder=str(RESOURCE_DIR / "static"),
+    )
+    app.config.update(BASE_DIR=BASE_DIR, APP_PORT=5001, MAX_CONTENT_LENGTH=65536)
+    if config:
+        app.config.update(config)
+    if "FFMPEG" not in app.config:
+        app.config["FFMPEG"] = find_ffmpeg()
+    if "JS_RUNTIMES" not in app.config:
+        app.config["JS_RUNTIMES"] = find_js_runtimes()
+    manager = JobManager(
+        app.config["BASE_DIR"],
+        app.config["FFMPEG"],
+        app.config["JS_RUNTIMES"],
+        downloader_factory or ArchiveAwareYoutubeDL,
+        executor if executor is not None else ThreadPoolExecutor(max_workers=MAX_CONCURRENT),
+    )
+    token = secrets.token_urlsafe(32)
+    app.extensions["job_manager"] = manager
+    app.extensions["csrf_token"] = token
+    opener = folder_opener or open_download_folder
+    expected_hosts = {f"127.0.0.1:{app.config['APP_PORT']}", f"localhost:{app.config['APP_PORT']}"}
+
+    @app.before_request
+    def protect_local_service():
+        if request.host.lower() not in expected_hosts:
+            return jsonify(error="Untrusted Host header"), 403
+        try:
+            if not ipaddress.ip_address(request.remote_addr or "").is_loopback:
+                return jsonify(error="Only loopback clients are allowed"), 403
+        except ValueError:
+            return jsonify(error="Only loopback clients are allowed"), 403
+        origin = request.headers.get("Origin")
+        if origin is not None and origin != f"http://{request.host.lower()}":
+            return jsonify(error="Cross-origin requests are not allowed"), 403
+        if request.headers.get("Sec-Fetch-Site") == "cross-site":
+            return jsonify(error="Cross-site requests are not allowed"), 403
+        if request.path.startswith("/api/") and not secrets.compare_digest(
+            request.headers.get("X-CSRF-Token", ""), token
+        ):
+            return jsonify(error="Missing or invalid request token; reload the page"), 403
+        return None
+
+    @app.after_request
+    def security_headers(response):
+        response.headers.update(
+            {
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "same-origin",
+            }
+        )
+        return response
+
+    @app.errorhandler(413)
+    def too_large(_error):
+        return jsonify(error="Request body is too large"), 413
+
+    @app.get("/")
+    def index():
+        return render_template("index.html", csrf_token=token)
+
+    @app.post("/api/download")
+    def download():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify(error="Send a JSON object with urls, format and quality"), 400
+        raw, fmt, quality = (
+            data.get("urls"),
+            data.get("format", "audio"),
+            data.get("quality", "192"),
+        )
+        if not isinstance(raw, str) or not isinstance(fmt, str) or fmt not in {"audio", "video"}:
+            return jsonify(error="urls must be text and format must be audio or video"), 400
+        if not isinstance(quality, str) or quality not in QUALITY:
+            return jsonify(error="quality must be 128, 192, 256 or 320"), 400
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        if not lines or len(lines) > MAX_URLS_PER_REQUEST:
+            return jsonify(
+                error=f"Submit between 1 and {MAX_URLS_PER_REQUEST} links per request"
+            ), 400
+        try:
+            urls = list(dict.fromkeys(normalize_url(line) for line in lines))
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+        if not manager.ffmpeg or not Path(manager.ffmpeg).is_file():
+            return jsonify(
+                error="FFmpeg was not found. Install FFmpeg and ffprobe, then restart the app"
+            ), 503
+        probe = Path(manager.ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if not probe.is_file():
+            return jsonify(
+                error="ffprobe is missing beside FFmpeg. Install both tools, then restart the app"
+            ), 503
+        if any(urlsplit(url).hostname in YOUTUBE_HOSTS for url in urls) and not manager.js_runtimes:
+            return jsonify(
+                error=(
+                    "YouTube needs a supported JavaScript runtime. "
+                    "Install Deno or Node.js 22+, then restart the app"
+                )
+            ), 503
+        result, status = manager.submit(urls, fmt, quality)
+        return jsonify(result), status
+
+    @app.get("/api/jobs")
+    def job_list():
+        with manager.lock:
+            rows = [dict(row) for row in reversed(list(manager.jobs.values()))]
+        return jsonify(rows)
+
+    @app.post("/api/clear")
+    def clear():
+        with manager.lock:
+            terminal_ids = [
+                identifier for identifier, row in manager.jobs.items() if row["status"] in TERMINAL
+            ]
+            for identifier in terminal_ids:
+                del manager.jobs[identifier]
+        return jsonify(ok=True, cleared=len(terminal_ids))
+
+    @app.post("/api/open-folder")
+    def open_folder():
+        try:
+            opener(manager.download_dir)
+        except OSError:
+            return jsonify(error="Could not open the downloads folder"), 500
+        return jsonify(ok=True)
+
+    @app.post("/api/shutdown")
+    def shutdown():
+        with manager.lock:
+            if any(row["status"] not in TERMINAL for row in manager.jobs.values()):
+                return jsonify(error="Wait for active downloads to finish before closing"), 409
+            if shutdown_callback is None:
+                return jsonify(error="Shutdown is not available in this server mode"), 503
+            manager.closing = True
+        shutdown_callback()
+        return jsonify(ok=True)
+
+    return app
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--no-browser", action="store_true", help="Do not open a browser at startup"
+    )
+    args = parser.parse_args(argv)
+    if FROZEN and (sys.stdout is None or sys.stderr is None):
+        log_file = open(BASE_DIR / "music-downloader.log", "a", encoding="utf-8", buffering=1)
+        if sys.stdout is None:
+            sys.stdout = log_file
+        if sys.stderr is None:
+            sys.stderr = log_file
+    from werkzeug.serving import make_server
+
+    def shutdown_server():
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    application = create_app(shutdown_callback=shutdown_server)
+    manager = application.extensions["job_manager"]
+    server = make_server("127.0.0.1", 5001, application, threaded=True)
+    print("Music Downloader is available at http://127.0.0.1:5001")
+    if not args.no_browser:
+        webbrowser.open("http://127.0.0.1:5001")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        manager.executor.shutdown(wait=True, cancel_futures=True)
+        server.server_close()
 
 
 if __name__ == "__main__":
-    # Windows .exe (--noconsole) modunda stdout/stderr None olur; print/werkzeug
-    # log'u çökmesin diye .exe'nin yanına bir log dosyasına yönlendir. Bu log
-    # aynı zamanda bir sorun olursa teşhis için işe yarar.
-    if FROZEN and (sys.stdout is None or sys.stderr is None):
-        _logf = open(os.path.join(BASE_DIR, "muzik-indirici.log"), "a",
-                     encoding="utf-8", buffering=1)
-        if sys.stdout is None:
-            sys.stdout = _logf
-        if sys.stderr is None:
-            sys.stderr = _logf
-
-    URL = "http://127.0.0.1:5001"
-    print("\n  🎵  Music Downloader çalışıyor")
-    print(f"  →  Tarayıcıda aç:  {URL}\n")
-
-    # Windows .exe olarak çalışırken tarayıcıyı açacak ayrı bir launcher yok;
-    # o yüzden sunucu kalkar kalkmaz tarayıcıyı uygulamanın kendisi açar.
-    # (Mac'te tarayıcıyı .app/run.sh açtığı için orada tekrar açmıyoruz.)
-    if FROZEN:
-        threading.Timer(1.5, lambda: webbrowser.open(URL)).start()
-
-    # host='127.0.0.1' KRİTİK: uygulama sadece kendi bilgisayarından erişilebilir,
-    # ağdaki başka cihazlar bağlanamaz. Güvenlik için böyle bırak.
-    app.run(host="127.0.0.1", port=5001, threaded=True, debug=False)
+    main()

@@ -1,24 +1,38 @@
+# Local environments and generated files
 .venv/
-downloads/
-archive-audio.txt
-archive-video.txt
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .DS_Store
+Thumbs.db
+*.log
 
-# PyInstaller derleme çıktıları / Windows exe artefaktları
+# Personal media, download history, credentials and local configuration
+downloads/
+archive*.txt
+.env
+.env.*
+cookies*.txt
+cookies*.json
+*.har
+*.mp3
+*.mp4
+*.m4a
+*.webm
+*.part
+*.ytdl
+*.zip
+local-inputs/
+
+# Packaging outputs and external executables
 build/
 dist/
 *.spec
+THIRD_PARTY_NOTICES/
 ffmpeg.exe
 ffprobe.exe
-*.log
-
-# Kişisel veri / çalışma dosyaları — GitHub'a GİTMESİN
-# (satır-içi yorum kullanma; git desteklemez)
-# WhatsApp sohbet dışa aktarımı — kişi kartı + telefon numarası içerir
-*.zip
-# sohbetten çıkarılan kişisel link listeleri
-whatsapp-linkler*.txt
-# kişisel şarkı adı listesi
-sarki-isimleri.txt
+deno.exe
+node.exe

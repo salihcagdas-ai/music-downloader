@@ -1,0 +1,12 @@
+#!/bin/bash
+# This launcher stays beside the repository; it is not a standalone macOS app.
+set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+PROJECT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+cd "$PROJECT_DIR"
+
+if [[ ! -f app.py || ! -x .venv/bin/python ]]; then
+  osascript -e 'display alert "Music Downloader" message "Keep this launcher beside app.py and complete the Python setup in README.md first." as critical' >/dev/null 2>&1
+  exit 1
+fi
+exec .venv/bin/python app.py >>music-downloader.log 2>&1
